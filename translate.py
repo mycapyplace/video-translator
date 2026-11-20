@@ -7,9 +7,11 @@ import ctranslate2
 import numpy as np
 from faster_whisper import WhisperModel
 
+MODEL_SIZE = "large-v3"
+LOCK_LANGUAGE = "ko"
+
 
 def _register_rocm_dlls():
-    """Register all pip-installed ROCm runtime bin directories on Windows."""
     for base in site.getsitepackages():
         if not os.path.isdir(base):
             continue
@@ -32,8 +34,8 @@ class WhisperTranslator:
         _register_rocm_dlls()
         if ctranslate2.get_cuda_device_count() > 0:
             try:
-                print("[Whisper] Loading large-v3 on RX 6700 XT (ROCm float16)...")
-                model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+                print(f"[Whisper] Loading {MODEL_SIZE} on RX 6700 XT (ROCm float16)...")
+                model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
                 list(
                     model.transcribe(
                         np.zeros(8000, dtype=np.float32), task="translate"
@@ -44,8 +46,8 @@ class WhisperTranslator:
             except Exception as exc:
                 print(f"[Whisper] GPU init failed ({exc}); falling back to CPU int8.")
 
-        print("[Whisper] Loading large-v3 on CPU (int8)...")
-        return WhisperModel("large-v3", device="cpu", compute_type="int8")
+        print(f"[Whisper] Loading {MODEL_SIZE} on CPU (int8)...")
+        return WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -57,9 +59,9 @@ class WhisperTranslator:
             self._thread.join(timeout=2.0)
 
     def _run(self):
-        self.text_queue.put("Loading Whisper large-v3 (first run downloads ~3 GB)...")
+        self.text_queue.put(("", f"Loading Whisper {MODEL_SIZE}..."))
         self.model = self._load_model()
-        self.text_queue.put("Listening for system audio...")
+        self.text_queue.put(("", "Listening for system audio..."))
 
         while not self._stop_event.is_set():
             try:
@@ -67,15 +69,35 @@ class WhisperTranslator:
             except queue.Empty:
                 continue
 
-            segments, info = self.model.transcribe(
+            orig_segments, info = self.model.transcribe(
                 chunk,
-                task="translate",
-                beam_size=5,
+                task="transcribe",
+                language=LOCK_LANGUAGE,
+                beam_size=1,
                 vad_filter=True,
                 condition_on_previous_text=False,
             )
+            original_text = " ".join(seg.text.strip() for seg in orig_segments).strip()
 
-            translated = " ".join(seg.text.strip() for seg in segments).strip()
-            if translated:
-                lang = info.language.upper()
-                self.text_queue.put(f"[{lang} → EN] {translated}")
+            if not original_text:
+                continue
+
+            detected_lang = LOCK_LANGUAGE or info.language
+
+            if detected_lang == "en":
+                self.text_queue.put((original_text, original_text))
+                continue
+
+            trans_segments, _ = self.model.transcribe(
+                chunk,
+                task="translate",
+                language=detected_lang,
+                beam_size=3,
+                vad_filter=True,
+                condition_on_previous_text=False,
+            )
+            translated_text = " ".join(
+                seg.text.strip() for seg in trans_segments
+            ).strip()
+
+            self.text_queue.put((original_text, translated_text))
